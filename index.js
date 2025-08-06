@@ -5,7 +5,8 @@ import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { Queue } from 'bullmq';
+import NodeCache from 'node-cache';
+import { Queue, Worker } from 'bullmq';
 import { GoogleGenerativeAIEmbeddings } from '@langchain/google-genai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { QdrantVectorStore } from '@langchain/qdrant';
@@ -13,10 +14,14 @@ import { QdrantVectorStore } from '@langchain/qdrant';
 // Initialize Gemini client
 const geminiClient = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
 
-const queue = new Queue('file-upload-queue',{
+const queue = new Queue('file-upload-queue', {
     connection: {
-        host: 'localhost',
-        port: 6379, 
+        host: process.env.REDIS_HOST || 'localhost',
+        port: 6379,
+        retryStrategy: (times) => {
+            // Retry connection every 5 seconds
+            return Math.min(times * 500, 2000);
+        }
     }
 });
 
@@ -38,8 +43,128 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
+// Initialize cache
+const cache = new NodeCache({ stdTTL: 600 }); // 10 minute cache
+
+// Initialize worker
+const worker = new Worker('file-upload-queue', async (job) => {
+    const { url, filename, savedTo } = JSON.parse(job.data);
+    try {
+        const embeddings = new GoogleGenerativeAIEmbeddings({
+            apiKey: process.env.GOOGLE_API_KEY,
+            model: 'models/embedding-001',
+        });
+        
+        const vectorStore = await QdrantVectorStore.fromExistingCollection(
+            embeddings,
+            {
+                url: `http://${process.env.QDRANT_HOST || 'localhost'}:6333`,
+                collectionName: 'langchainjs-testing',
+                timeout: 10000
+            }
+        );
+        
+        return { status: 'completed', vectorStore };
+    } catch (error) {
+        console.error('Worker error:', error);
+        throw error;
+    }
+}, {
+    connection: {
+        host: process.env.REDIS_HOST || 'localhost',
+        port: 6379
+    }
+});
+
 const app = express();
 app.use(express.json());
+
+// Cache middleware
+const cacheMiddleware = (req, res, next) => {
+    if (req.method !== 'GET') return next();
+    
+    const key = req.originalUrl;
+    const cachedResponse = cache.get(key);
+    
+    if (cachedResponse) {
+        return res.json(cachedResponse);
+    }
+    next();
+};
+
+app.post('/api/v1/hackrx/run', async (req, res) => {
+    const { documents, questions } = req.body;
+    if (!documents || !questions) {
+        return res.status(400).json({ error: 'Missing documents or questions' });
+    }
+
+    try {
+        const cacheKey = `${documents}-${questions.join(',')}`;
+        const cachedResult = cache.get(cacheKey);
+        
+        if (cachedResult) {
+            return res.json(cachedResult);
+        }
+
+        const job = await queue.add('file-upload-queue', JSON.stringify({
+            documents,
+            questions,
+            timestamp: new Date().toISOString()
+        }), {
+            attempts: 3,
+            backoff: {
+                type: 'exponential',
+                delay: 1000
+            }
+        });
+
+        // Return job ID and webhook URL
+        const webhookUrl = `${req.protocol}://${req.get('host')}/api/v1/hackrx/status/${job.id}`;
+        res.status(202).json({
+            success: true,
+            jobId: job.id,
+            status: 'processing',
+            webhookUrl
+        });
+
+    } catch (error) {
+        console.error('Error:', error);
+        res.status(500).json({ 
+            success: false, 
+            error: 'Failed to process request' 
+        });
+    }
+});
+
+// Add status endpoint
+app.get('/api/v1/hackrx/status/:jobId', async (req, res) => {
+    try {
+        const job = await queue.getJob(req.params.jobId);
+        if (!job) {
+            return res.status(404).json({
+                success: false,
+                error: 'Job not found'
+            });
+        }
+
+        const state = await job.getState();
+        const result = await job.finished();
+
+        res.json({
+            success: true,
+            jobId: job.id,
+            state,
+            result: result || null
+        });
+
+    } catch (error) {
+        console.error('Status check error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to get job status'
+        });
+    }
+});
 
 app.post('/hackrx/run', async (req, res) => {
   const { documents, questions } = req.body;
@@ -89,11 +214,13 @@ app.post('/hackrx/run', async (req, res) => {
             model: 'models/embedding-001',
           });
 
+          // Update Qdrant connection configuration
           const vectorStore = await QdrantVectorStore.fromExistingCollection(
             embeddings,
             {
-              url: 'http://localhost:6333',
-              collectionName: 'langchainjs-testing',
+                url: `http://${process.env.QDRANT_HOST || 'localhost'}:6333`,
+                collectionName: 'langchainjs-testing',
+                timeout: 10000 // 10 second timeout
             }
           );
 
@@ -139,6 +266,29 @@ app.post('/hackrx/run', async (req, res) => {
   }
 });
 
-app.listen(3000, () => {
-  console.log('Server running on http://localhost:3000');
+// Add health check endpoint
+app.get('/health', (req, res) => {
+    res.status(200).json({ status: 'ok' });
+});
+
+// Add error handling middleware
+app.use((err, req, res, next) => {
+    console.error('Error:', err);
+    res.status(500).json({ 
+        error: 'Internal Server Error',
+        message: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
+});
+
+// Update server listening
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on http://0.0.0.0:${PORT}`);
+});
+
+// Add graceful shutdown
+process.on('SIGTERM', async () => {
+    console.log('Shutting down...');
+    await worker.close();
+    process.exit(0);
 });
